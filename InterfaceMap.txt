@@ -1,0 +1,33 @@
+class LoreManager
+├── __init__(self, db_path: str = "./chroma_db", collection_name: str = "world_lore",
+│            embedding_model: str = "BAAI/bge-base-en-v1.5") -> None
+│   Initializes the persistent ChromaDB client, binds the bge-base-en-v1.5 embedding
+│   function, and gets or creates the target collection.
+├── collection -> chromadb.Collection  (property)
+│   Exposes the underlying ChromaDB collection for advanced or debugging use.
+├── _chunk_text(self, text: str, chunk_size: int = 250, overlap: int = 50) -> list[str]
+│   Splits text into sliding word-window chunks of `chunk_size` words sharing
+│   `overlap` words of context with the previous chunk.
+├── _build_ids(self, source_id: str, chunks: list[str]) -> list[str]
+│   Derives stable content-hashed ChromaDB ids (source-prefixed) for each chunk
+│   so re-inserts upsert instead of duplicating.
+├── _sanitize_metadata(self, metadata: dict[str, Any]) -> dict[str, str]
+│   Drops None-valued keys and stringifies remaining values to satisfy ChromaDB's
+│   metadata constraints.
+├── insert_lore(self, text: str, lore_type: str, character_id: Optional[str] = None,
+│               location_id: Optional[str] = None, source_id: Optional[str] = None,
+│               extra_metadata: Optional[dict[str, Any]] = None,
+│               chunk_size: int = 250, overlap: int = 50) -> list[str]
+│   Chunks the lore text, attaches per-chunk metadata (type, character_id,
+│   location_id, chunk_index, total_chunks), embeds, and upserts into the
+│   collection, returning the written ids.
+├── _build_where_clause(self, metadata_filter: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]
+│   Validates and normalizes an optional metadata filter into a ChromaDB where clause,
+│   stripping None values and returning None when no filter is given.
+├── search_lore(self, query: str, n_results: int = 3,
+│               metadata_filter: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]
+│   Embeds the query, runs a ChromaDB .query() with an optional metadata where-clause,
+│   and returns a flattened list of {id, text, metadata, distance} dicts sorted
+│   most-similar-first (lower distance = higher similarity).
+└── _default_source_id(self, text: str) -> str
+    Returns a content-hash-based fallback source id when none is supplied by the caller.
