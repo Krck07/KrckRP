@@ -29,6 +29,12 @@ class LoreManager:
         """Set up the persistent ChromaDB client, the embedding function,
         and the target collection.
 
+        The embedding model is placed on the best available accelerator,
+        tried in priority order: CUDA GPU (only if present), DirectML
+        (integrated graphics), then CPU. If every explicit device fails,
+        it falls back to the SentenceTransformer library's own default
+        device selection, so initialization never hard-crashes.
+
         Args:
             db_path: Filesystem location where ChromaDB persists data.
             collection_name: Name of the collection to get or create.
@@ -36,9 +42,8 @@ class LoreManager:
                 embedding all documents and queries.
         """
         self._client: chromadb.ClientAPI = chromadb.PersistentClient(path=db_path)
-        self._embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=embedding_model
-        )
+        self._active_device: str = "unknown"
+        self._embedding_function = self._create_embedding_function(embedding_model)
         self._collection: Collection = self._client.get_or_create_collection(
             name=collection_name,
             embedding_function=self._embedding_function,
@@ -48,6 +53,68 @@ class LoreManager:
     def collection(self) -> Collection:
         """Expose the underlying ChromaDB collection for advanced use."""
         return self._collection
+
+    @property
+    def device(self) -> str:
+        """The device the embedding model was placed on
+        (e.g. 'cuda', 'dml', 'cpu', or 'default' for library fallback)."""
+        return self._active_device
+
+    def _create_embedding_function(
+        self, embedding_model: str
+    ) -> embedding_functions.SentenceTransformerEmbeddingFunction:
+        """Build the embedding function on the best available device.
+
+        Candidate devices are tried in priority order — "cuda" (only when
+        torch reports a GPU), "dml" (integrated graphics via DirectML),
+        "cpu" — and every candidate is validated by actually loading the
+        model and running one probe embedding, so a device string the
+        installed torch build doesn't support can never slip through to
+        runtime. If all explicit devices fail, the final candidate passes
+        no ``device`` kwarg at all, letting the SentenceTransformer
+        library choose its own default (the requested failsafe).
+
+        Args:
+            embedding_model: SentenceTransformer model name to load.
+
+        Returns:
+            A ready, verified SentenceTransformerEmbeddingFunction.
+
+        Raises:
+            RuntimeError: Only if even the library-default construction
+                fails (e.g. model missing and no network access).
+        """
+        candidates: list[Optional[str]] = []
+        try:
+            import torch  # type: ignore
+
+            if torch.cuda.is_available():
+                candidates.append("cuda")
+        except ImportError:
+            pass  # torch missing: skip explicit CUDA candidate
+        candidates += ["dml", "cpu", None]  # None == library default (failsafe)
+
+        last_error: Optional[BaseException] = None
+        for device in candidates:
+            try:
+                kwargs: dict[str, Any] = {"device": device} if device is not None else {}
+                ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+                    model_name=embedding_model, **kwargs
+                )
+                # ChromaDB's wrapper loads the model lazily, so force the
+                # load + one forward pass now to verify the device works.
+                ef(["device probe"])
+                self._active_device = device if device is not None else "default"
+                print(f"[LoreManager] embedding device: {self._active_device}")
+                return ef
+            except BaseException as exc:  # noqa: BLE001 - deliberate broad catch
+                last_error = exc
+
+        raise RuntimeError(
+            "Could not initialize the embedding model on any device "
+            "(tried cuda, dml, cpu, library default). Last error: "
+            f"{last_error}"
+        )
 
     def _chunk_text(
         self,

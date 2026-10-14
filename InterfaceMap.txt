@@ -1,10 +1,19 @@
 class LoreManager
 ├── __init__(self, db_path: str = "./chroma_db", collection_name: str = "world_lore",
 │            embedding_model: str = "BAAI/bge-base-en-v1.5") -> None
-│   Initializes the persistent ChromaDB client, binds the bge-base-en-v1.5 embedding
-│   function, and gets or creates the target collection.
+│   Initializes the persistent ChromaDB client, places the embedding model on the
+│   best available device (cuda > dml > cpu > library default) with verified
+│   failsafe, and gets or creates the target collection.
 ├── collection -> chromadb.Collection  (property)
 │   Exposes the underlying ChromaDB collection for advanced or debugging use.
+├── device -> str  (property)
+│   Returns the device the embedding model was placed on ('cuda', 'dml', 'cpu',
+│   or 'default').
+├── _create_embedding_function(self, embedding_model: str)
+│   -> embedding_functions.SentenceTransformerEmbeddingFunction
+│   Tries cuda/dml/cpu/library-default in order, validates each by loading the
+│   model and running one probe embedding, and returns the first working
+│   embedding function (raises RuntimeError only if all fail).
 ├── _chunk_text(self, text: str, chunk_size: int = 250, overlap: int = 50) -> list[str]
 │   Splits text into sliding word-window chunks of `chunk_size` words sharing
 │   `overlap` words of context with the previous chunk.
@@ -21,13 +30,30 @@ class LoreManager
 │   Chunks the lore text, attaches per-chunk metadata (type, character_id,
 │   location_id, chunk_index, total_chunks), embeds, and upserts into the
 │   collection, returning the written ids.
-├── _build_where_clause(self, metadata_filter: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]
-│   Validates and normalizes an optional metadata filter into a ChromaDB where clause,
-│   stripping None values and returning None when no filter is given.
+├── _build_where_clause(self, metadata_filter: Optional[dict[str, Any]])
+│   -> Optional[dict[str, Any]]
+│   Validates and normalizes an optional metadata filter into a ChromaDB where
+│   clause, stripping None values and returning None when no filter is given.
 ├── search_lore(self, query: str, n_results: int = 3,
 │               metadata_filter: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]
-│   Embeds the query, runs a ChromaDB .query() with an optional metadata where-clause,
-│   and returns a flattened list of {id, text, metadata, distance} dicts sorted
-│   most-similar-first (lower distance = higher similarity).
+│   Embeds the query, runs a ChromaDB .query() with an optional metadata
+│   where-clause, and returns a flattened list of {id, text, metadata, distance}
+│   dicts sorted most-similar-first (lower distance = higher similarity).
 └── _default_source_id(self, text: str) -> str
     Returns a content-hash-based fallback source id when none is supplied by the caller.
+
+class StateManager
+├── __init__(self, db_path: str = "game_state.db") -> None
+│   Opens (creating if needed) the SQLite database and creates the four state tables and indexes if absent.
+├── upsert_player(self, player_id: str, name: str, hp: int, max_hp: int, level: int,
+│                 current_location_id: Optional[str] = None) -> None
+│   Atomically inserts a player or overwrites the full stat block for an existing id.
+├── upsert_npc(self, npc_id: str, name: str, location_id: Optional[str],
+│              disposition_score: int = 0) -> None
+│   Inserts an NPC or updates its name, location, and disposition in place.
+├── upsert_location(self, location_id: str, name: str, base_description: str = "") -> None
+│   Inserts a location or refreshes its name and base description.
+├── upsert_inventory_item(self, item_id: str, owner_id: str, item_name: str, quantity: int) -> None
+│   Inserts an inventory entry or sets its owner, name, and absolute quantity.
+└── get_player_state(self, player_id: str) -> Optional[dict[str, Any]]
+    Returns a single consolidated dict with the player's stats, current location, co-located NPCs, and inventory, or None if the player doesn't exist.
