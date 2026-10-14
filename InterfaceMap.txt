@@ -57,3 +57,76 @@ class StateManager
 │   Inserts an inventory entry or sets its owner, name, and absolute quantity.
 └── get_player_state(self, player_id: str) -> Optional[dict[str, Any]]
     Returns a single consolidated dict with the player's stats, current location, co-located NPCs, and inventory, or None if the player doesn't exist.
+    
+    KrckRP Orchestrator (FastAPI, v0.1.0)
+├── ROUTES
+│   ├── GET  /health
+│   │   └── health() -> dict[str, Any]
+│   │       Liveness probe; returns config (kobold URL, model, DB paths). No LLM/heavy init.
+│   └── POST /api/action  (response_model=PlayerActionResponse)
+│       └── player_action(req: PlayerActionRequest,
+│                         state_mgr = Depends(get_state_manager),
+│                         lore_mgr  = Depends(get_lore_manager),
+│                         llm       = Depends(get_llm_client))
+│                         -> PlayerActionResponse
+│           Pipeline: get_player_state → 404 if None
+│                     → search_lore(action, n, {location_id}) [+ global fallback]
+│                     → build_messages → llm.complete
+│                     → 200 {narrative, lore, state} | 502 on LLM failure
+│
+├── PYDANTIC MODELS
+│   ├── PlayerActionRequest(BaseModel)
+│   │   ├── player_id: str          (min_length=1)
+│   │   ├── action_text: str        (min_length=1)
+│   │   └── n_lore_results: int = 3 (ge=1, le=20)
+│   └── PlayerActionResponse(BaseModel)
+│       ├── narrative_response: str
+│       ├── retrieved_lore: list[dict[str, Any]]
+│       └── current_state: dict[str, Any]
+│
+├── LLM CLIENT (KoboldCpp, OpenAI-compatible)
+│   └── LLMClient
+│       ├── __init__(base_url = "http://localhost:5001/v1",
+│       │            api_key  = "not-needed", model = "local-model",
+│       │            timeout  = 180.0,
+│       │            client: Optional[httpx.Client] = None) -> None
+│       │       (client injectable for MockTransport tests)
+│       ├── _get_client(self) -> tuple[httpx.Client, bool]
+│       │       Returns injected client or a fresh one; bool = whether we own/close it.
+│       └── complete(self, messages: list[dict[str, str]],
+│                    temperature: float = 0.85,
+│                    max_tokens: int = 1024) -> str
+│           POST {base_url}/chat/completions; returns choices[0].message.content;
+│           raises on transport error / missing choices / missing content.
+│
+├── DEPENDENCY PROVIDERS (module-level singletons, lazy import)
+│   ├── get_state_manager() -> StateManager   # state_memory.state_manager, SQLite at STATE_DB_PATH
+│   ├── get_lore_manager()  -> LoreManager    # lore_manager, ChromaDB at CHROMA_DB_PATH
+│   └── get_llm_client()    -> LLMClient
+│
+├── PROMPT ASSEMBLY (pure functions — unit-testable in isolation)
+│   ├── DM_SYSTEM_PROMPT: str
+│   │       Uncensored tabletop-GM instructions; state is authoritative; ground in lore;
+│   │       second-person present tense; 1–3 paragraphs; end on a choice/tension.
+│   ├── _pick(mapping: Any, *keys: str) -> Any
+│   │       First non-empty value among candidate keys (schema-tolerant state access).
+│   ├── _format_npcs(npcs: Any) -> str
+│   ├── _format_inventory(items: Any) -> str
+│   ├── format_state_for_prompt(state: dict[str, Any]) -> str
+│   │       GM brief: name, HP x/y, level, location (+id), NPCs (disposition), inventory.
+│   ├── format_lore_for_prompt(lore: list[dict[str, Any]]) -> str
+│   │       Numbered snippets with distance + metadata tags; explicit marker if empty.
+│   └── build_messages(state: dict[str, Any], lore: list[dict[str, Any]],
+│                      action_text: str, temperature: float = 0.85)
+│                      -> list[dict[str, str]]
+│       Returns [{"role":"system", ...}, {"role":"user", ...}] per the pipeline doc.
+│
+├── APP / ENTRYPOINT
+│   ├── create_app() -> FastAPI      # builds routes; separated for testability
+│   ├── app: FastAPI                 # module-level instance used by tests & uvicorn
+│   └── run(host: str = "127.0.0.1", port: int = 8000) -> None
+│       uvicorn.run(app, ...); also `python orchestrator.py` via __main__.
+│
+└── CONFIG (env-overridable constants)
+    KOBOLD_BASE_URL · KOBOLD_API_KEY · KOBOLD_MODEL · KOBOLD_TIMEOUT
+    STATE_DB_PATH · CHROMA_DB_PATH · EMBEDDING_MODEL · FALLBACK_TO_GLOBAL_LORE (default on)
