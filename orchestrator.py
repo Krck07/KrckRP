@@ -1,8 +1,9 @@
-"""FastAPI Orchestrator Engine.
+"""FastAPI Orchestrator Engine (v0.2.0).
 
 Connects three subsystems into a single ``POST /api/action`` endpoint:
 
-    1. ``StateManager``  -- SQLite "hard" state (HP, level, location, NPCs, inventory)
+    1. ``StateManager``  -- SQLite "hard" state (HP, level, location, NPCs, inventory,
+                            quests) + multi-turn chat history
     2. ``LoreManager``   -- ChromaDB lore RAG (semantic search over world lore)
     3. ``KoboldCpp``     -- local LLM behind an OpenAI-compatible HTTP API
                             (default ``http://localhost:5001/v1``)
@@ -10,11 +11,14 @@ Connects three subsystems into a single ``POST /api/action`` endpoint:
 Pipeline per request
 --------------------
     PlayerActionRequest
-        -> StateManager.get_player_state(player_id)         [hard state]
-        -> LoreManager.search_lore(action, location_id)     [RAG context]
-        -> build_messages(state, lore, action)              [prompt assembly]
-        -> LLMClient.complete(messages)                     [KoboldCpp /chat/completions]
-        -> PlayerActionResponse{narrative, retrieved_lore, current_state}
+        -> StateManager.get_player_state(player_id)           [hard state]
+        -> LoreManager.search_lore(action, location_id)       [RAG context]
+        -> StateManager.get_recent_chat(player_id)            [sliding chat window]
+        -> build_messages(state, lore, action, chat_history)  [prompt assembly]
+        -> LLMClient.complete(messages)                       [KoboldCpp /chat/completions]
+        -> parse_and_apply_mutations(raw, player, state_mgr)  [apply <state_update>, clean text]
+        -> append_chat_turn("user") + append_chat_turn("assistant")
+        -> PlayerActionResponse{cleaned narrative, retrieved_lore, fresh state}
 
 Design notes
 ------------
@@ -25,14 +29,22 @@ Design notes
 * The LLM call is isolated behind :class:`LLMClient` so tests can inject an
   ``httpx.MockTransport`` and exercise the *real* request-building code path
   without a live KoboldCpp server.
-* The prompt builder (:func:`build_messages`) is a pure function of
-  ``(state, lore, action)`` and can be unit-tested in isolation.
+* The prompt builder (:func:`build_messages`) and the state-mutation parser
+  (:func:`parse_and_apply_mutations`) are pure functions of their inputs and
+  can be unit-tested in isolation.
+* The GM system prompt is **external**: loaded from ``system_prompts.json``
+  (``base_dm_rules`` + ``combat_rules`` + ``formatting_instructions``) into the
+  module-level ``SYSTEM_PROMPTS`` dict at import time, so the persona, combat
+  handling, and the ``<state_update>`` protocol can be tuned without code
+  changes.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from typing import Any, Optional, TYPE_CHECKING
 
 import httpx
@@ -55,7 +67,12 @@ KOBOLD_TIMEOUT: float = float(os.environ.get("KOBOLD_TIMEOUT", "180"))
 
 STATE_DB_PATH: str = os.environ.get("STATE_DB_PATH", "game_state.db")
 CHROMA_DB_PATH: str = os.environ.get("CHROMA_DB_PATH", "./chroma_db")
+CHROMA_COLLECTION: str = os.environ.get("CHROMA_COLLECTION", "world_lore")
 EMBEDDING_MODEL: str = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
+
+# External GM prompt configuration (single JSON object with the three prompt
+# sections below). Relative paths resolve against the current working directory.
+SYSTEM_PROMPTS_PATH: str = os.environ.get("SYSTEM_PROMPTS_PATH", "system_prompts.json")
 
 # If the location-scoped RAG query returns nothing, fall back to a global query
 # so the LLM still has *some* world context. Set to False to force strict scope.
@@ -64,6 +81,11 @@ FALLBACK_TO_GLOBAL_LORE: bool = os.environ.get("FALLBACK_TO_GLOBAL_LORE", "1") n
     "false",
     "False",
 )
+
+LLM_TEMPERATURE: float = float(os.environ.get("LLM_TEMPERATURE", "0.85"))
+
+# Sliding window: how many past chat turns are replayed into each prompt.
+RECENT_CHAT_LIMIT: int = int(os.environ.get("RECENT_CHAT_LIMIT", "15"))
 
 # --------------------------------------------------------------------------- #
 # Pydantic request / response models
@@ -88,12 +110,14 @@ class PlayerActionRequest(BaseModel):
 class PlayerActionResponse(BaseModel):
     """Narrative plus the hard state and lore that produced it (for debugging/audit)."""
 
-    narrative_response: str = Field(..., description="The GM's narrative prose.")
+    narrative_response: str = Field(
+        ..., description="The GM's narrative prose (cleaned — any <state_update> block removed)."
+    )
     retrieved_lore: list[dict[str, Any]] = Field(
         ..., description="Raw LoreManager.search_lore() results used to ground the scene."
     )
     current_state: dict[str, Any] = Field(
-        ..., description="The authoritative StateManager state snapshot for the player."
+        ..., description="The freshly re-read StateManager state snapshot after mutation."
     )
 
 
@@ -199,8 +223,15 @@ def get_lore_manager():
     if _lore_manager is None:
         from lore_manager import LoreManager  # lazy: chromadb + sentence-transformers + torch
 
-        log.info("Initialising LoreManager (chroma=%s, model=%s)", CHROMA_DB_PATH, EMBEDDING_MODEL)
-        _lore_manager = LoreManager(db_path=CHROMA_DB_PATH, embedding_model=EMBEDDING_MODEL)
+        log.info(
+            "Initialising LoreManager (chroma=%s, collection=%s, model=%s)",
+            CHROMA_DB_PATH, CHROMA_COLLECTION, EMBEDDING_MODEL,
+        )
+        _lore_manager = LoreManager(
+            db_path=CHROMA_DB_PATH,
+            collection_name=CHROMA_COLLECTION,
+            embedding_model=EMBEDDING_MODEL,
+        )
     return _lore_manager
 
 
@@ -213,28 +244,46 @@ def get_llm_client() -> LLMClient:
 
 
 # --------------------------------------------------------------------------- #
+# External system prompt configuration (system_prompts.json)
+# --------------------------------------------------------------------------- #
+SYSTEM_PROMPT_KEYS: tuple[str, ...] = ("base_dm_rules", "combat_rules", "formatting_instructions")
+
+
+def _load_system_prompts(path: str = SYSTEM_PROMPTS_PATH) -> dict[str, str]:
+    """Load the external GM prompt configuration from a JSON file.
+
+    Expects a single JSON object with the non-empty string keys
+    ``base_dm_rules``, ``combat_rules`` and ``formatting_instructions``.
+    Raises :class:`RuntimeError` with a clear message when the file is
+    missing, unparseable, or incomplete, so a broken configuration fails
+    loudly at startup instead of mid-request.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"System prompt config not found at {path!r}. Create a JSON object with "
+            "the keys: base_dm_rules, combat_rules, formatting_instructions "
+            "(or set SYSTEM_PROMPTS_PATH)."
+        ) from None
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"System prompt config at {path!r} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"System prompt config at {path!r} must be a single JSON object.")
+    missing = [key for key in SYSTEM_PROMPT_KEYS if not str(data.get(key) or "").strip()]
+    if missing:
+        raise RuntimeError(f"System prompt config at {path!r} is missing required key(s): {', '.join(missing)}.")
+    return {key: str(data[key]).strip() for key in SYSTEM_PROMPT_KEYS}
+
+
+# Global prompt configuration, loaded once at startup (module import).
+SYSTEM_PROMPTS: dict[str, str] = _load_system_prompts()
+
+
+# --------------------------------------------------------------------------- #
 # Prompt assembly (pure, unit-testable)
 # --------------------------------------------------------------------------- #
-DM_SYSTEM_PROMPT: str = """\
-You are the Game Master (GM) of a persistent, tabletop-style role-playing world.
-You are the authoritative voice of continuity: vivid, in-character, and grounded
-exclusively in the hard state and lore supplied below.
-
-Rules of play:
-- Hard state (HP, level, inventory, location, NPCs) is AUTHORITATIVE and is
-  changed by the system, not by you. Describe the *consequences* of the player's
-  action, never invent stat deltas or items that aren't in state.
-- Ground your narration in the Retrieved Lore. If lore is thin or absent, stay
-  consistent with the known state and do not contradict established facts.
-- Keep every co-located NPC consistent with their disposition; let them react.
-- Tone: mature, gritty, unflinching, and uncensored in the way a serious
-  tabletop campaign is. Depict violence, moral complexity, and adult themes as
-  the story demands, but always serve the narrative and the player's agency.
-- Write in second person, present tense. Keep it to 1-3 tight paragraphs.
-- End by setting up the next beat and presenting a clear choice or tension.
-- Never break the fourth wall, never add OOC commentary, and never refuse
-  in-character content.
-"""
 
 
 def _pick(mapping: Any, *keys: str) -> Any:
@@ -265,6 +314,23 @@ def _format_inventory(items: Any) -> str:
     return "\n".join(lines) if lines else "  (inventory empty)"
 
 
+def _format_quests(quests: Any) -> str:
+    if not quests:
+        return "  (no active quests)"
+    lines = []
+    for quest in quests:
+        if isinstance(quest, dict):
+            title = _pick(quest, "title", "name") or _pick(quest, "quest_id", "id")
+            status = quest.get("status")
+            line = f"  - {title or 'Unknown quest'}"
+            if status is not None:
+                line += f" (status: {status})"
+            lines.append(line)
+        else:
+            lines.append(f"  - {quest}")
+    return "\n".join(lines) if lines else "  (no active quests)"
+
+
 def _format_npcs(npcs: Any) -> str:
     if not npcs:
         return "  (no NPCs present)"
@@ -283,17 +349,32 @@ def _format_npcs(npcs: Any) -> str:
 
 
 def format_state_for_prompt(state: dict[str, Any]) -> str:
-    """Render the authoritative player state as a readable GM brief."""
-    name = _pick(state, "name", "player_name") or state.get("player_id")
-    hp = _pick(state, "hp", "current_hp")
-    max_hp = _pick(state, "max_hp", "maximum_hp", "maxHp")
-    level = _pick(state, "level", "player_level")
+    """Render the authoritative player state as a readable GM brief.
+
+    Targets the StateManager.get_player_state() shape: player stats live in
+    the nested ``player`` dict (``state["player"]["name" / "hp" / "max_hp" /
+    "level"]``), while location, npcs_here, inventory, and quests are
+    top-level keys. A flat dict (stats at the top level) is still tolerated
+    as a fallback.
+    """
+    player = state.get("player")
+    if not isinstance(player, dict):
+        player = state  # tolerate a flat state dict
+
+    name = _pick(player, "name", "player_name") or state.get("player_id")
+    hp = _pick(player, "hp", "current_hp")
+    max_hp = _pick(player, "max_hp", "maximum_hp", "maxHp")
+    level = _pick(player, "level", "player_level")
 
     location = state.get("location")
     if not isinstance(location, dict):
         location = {}
     loc_name = _pick(location, "name", "location_name", "title") or _pick(state, "location_name")
-    loc_id = _pick(location, "location_id", "id") or _pick(state, "current_location_id", "location_id")
+    loc_id = (
+        _pick(location, "location_id", "id")
+        or _pick(player, "current_location_id")
+        or _pick(state, "current_location_id", "location_id")
+    )
 
     hp_text = f"{hp}/{max_hp}" if hp is not None and max_hp is not None else (
         f"{hp}" if hp is not None else "unknown"
@@ -306,10 +387,13 @@ def format_state_for_prompt(state: dict[str, Any]) -> str:
         f"  Location: {loc_name or 'Unknown'}" + (f" (id: {loc_id})" if loc_id else ""),
         "",
         "  Co-located NPCs:",
-        _format_npcs(state.get("npcs") or state.get("co_located_npcs") or state.get("present_npcs")),
+        _format_npcs(state.get("npcs") or state.get("npcs_here") or state.get("co_located_npcs") or state.get("present_npcs")),
         "",
         "  Inventory:",
         _format_inventory(state.get("inventory") or state.get("items") or state.get("inv")),
+        "",
+        "  Quests:",
+        _format_quests(state.get("quests")),
     ]
     return "\n".join(parts)
 
@@ -338,17 +422,25 @@ def build_messages(
     state: dict[str, Any],
     lore: list[dict[str, Any]],
     action_text: str,
-    temperature: float = 0.85,
+    chat_history: Optional[list[dict[str, str]]] = None,
+    temperature: float = LLM_TEMPERATURE,
 ) -> list[dict[str, str]]:
-    """Assemble the system/user prompt from hard state + RAG lore + player action.
+    """Assemble the OpenAI-style prompt from state + lore + recent chat + action.
 
-    Returns an OpenAI-style message list: one ``system`` message carrying (a) the
-    GM instructions, (b) the authoritative state, and (c) the lore context, plus a
-    single ``user`` message carrying (d) the player's action.
+    Message order:
+      1. ``system``  — GM instructions loaded from ``system_prompts.json``
+         (``base_dm_rules`` + ``combat_rules`` + ``formatting_instructions``,
+         the last carrying the State Mutation Protocol incl. ``quest_updates``),
+         then the authoritative SQLite state and the retrieved ChromaDB lore.
+      2. recent chat turns (sliding window, oldest-first) — each validated to a
+         ``user``/``assistant`` role with non-empty content.
+      3. ``user``    — the player's current action.
     """
     system_parts = [
-        DM_SYSTEM_PROMPT,
-        "\n## CURRENT WORLD STATE (authoritative -- do not override)\n"
+        SYSTEM_PROMPTS["base_dm_rules"],
+        SYSTEM_PROMPTS["combat_rules"],
+        SYSTEM_PROMPTS["formatting_instructions"],
+        "\n## CURRENT WORLD STATE (authoritative -- apply changes only via the State Mutation Protocol)\n"
         + format_state_for_prompt(state),
         "\n## RETRIEVED LORE CONTEXT (ground your narration here)\n"
         + format_lore_for_prompt(lore),
@@ -360,10 +452,160 @@ def build_messages(
         f"Player action: {action_text.strip()}"
     )
 
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
+    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    for turn in chat_history or []:
+        if not isinstance(turn, dict):
+            continue
+        role = turn.get("role")
+        content = (turn.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user})
+    return messages
+
+
+# --------------------------------------------------------------------------- #
+# State mutation parsing (LLM <state_update> block -> StateManager calls)
+# --------------------------------------------------------------------------- #
+# Tag-anchored, non-greedy, DOTALL:
+#   * <state_update> ... </state_update> anchors the capture to the tags, so
+#     narrative prose that merely mentions JSON is never touched.
+#   * \s* trims LLM-added whitespace/newlines around the payload.
+#   * .*? (non-greedy) stops at the FIRST closing tag, so multiple blocks in one
+#     response are captured one-by-one via finditer.
+#   * re.DOTALL lets the JSON span multiple lines if the LLM pretty-prints it.
+STATE_UPDATE_PATTERN: "re.Pattern[str]" = re.compile(
+    r"<state_update>\s*(?P<payload>.*?)\s*</state_update>",
+    re.DOTALL,
+)
+
+
+def _loads_json_block(raw: str) -> Optional[dict[str, Any]]:
+    """Parse a captured payload as a JSON object; tolerate code fences.
+
+    Returns the dict, or ``None`` (with a warning) when the payload is not a
+    valid JSON object.
+    """
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        # Some models wrap the JSON in a markdown fence despite the protocol.
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        log.warning("Malformed <state_update> JSON ignored (%s): %r", exc, raw[:200])
+        return None
+    if not isinstance(data, dict):
+        log.warning("<state_update> payload is not a JSON object, ignored: %r", raw[:200])
+        return None
+    return data
+
+
+def _apply_mutations(payload: dict[str, Any], player_id: str, state_mgr) -> None:
+    """Apply one parsed <state_update> payload through StateManager methods.
+
+    Handles ``hp_change``, ``inventory_add``, ``inventory_remove``,
+    ``quest_updates`` (each {"quest_id", "status"} entry advances an existing
+    quest via :meth:`StateManager.update_quest_status`), and ``quest_add``
+    (each {"quest_id", "title", "description", "status"} entry creates or
+    refreshes a quest via :meth:`StateManager.upsert_quest`).
+    """
+    hp_change = payload.get("hp_change")
+    if isinstance(hp_change, bool):
+        hp_change = None
+    if isinstance(hp_change, (int, float)):
+        delta = int(hp_change)
+        if delta:
+            state_mgr.update_player_hp(player_id, delta)
+            log.info("hp_change %+d applied to player %s", delta, player_id)
+
+    adds = payload.get("inventory_add")
+    if isinstance(adds, list):
+        for entry in adds:
+            if not isinstance(entry, dict):
+                continue
+            item_id = str(entry.get("item_id") or "").strip()
+            if not item_id:
+                continue
+            item_name = str(entry.get("item_name") or item_id).strip()
+            try:
+                quantity = int(entry.get("quantity", 1))
+            except (TypeError, ValueError):
+                quantity = 1
+            if quantity <= 0:
+                continue
+            state_mgr.upsert_inventory_item(item_id, player_id, item_name, quantity)
+            log.info("inventory_add %s x%d for player %s", item_id, quantity, player_id)
+
+    removes = payload.get("inventory_remove")
+    if isinstance(removes, list):
+        for item_id in removes:
+            item_id = str(item_id).strip()
+            if not item_id:
+                continue
+            state_mgr.remove_inventory_item(item_id, player_id)
+            log.info("inventory_remove %s for player %s", item_id, player_id)
+
+    quest_updates = payload.get("quest_updates")
+    if isinstance(quest_updates, list):
+        for entry in quest_updates:
+            if not isinstance(entry, dict):
+                continue
+            quest_id = str(entry.get("quest_id") or "").strip()
+            status = str(entry.get("status") or "").strip()
+            if not quest_id or not status:
+                continue
+            state_mgr.update_quest_status(player_id, quest_id, status)
+            log.info("quest %s -> %s for player %s", quest_id, status, player_id)
+
+    quest_adds = payload.get("quest_add")
+    if isinstance(quest_adds, list):
+        for entry in quest_adds:
+            if not isinstance(entry, dict):
+                continue
+            quest_id = str(entry.get("quest_id") or "").strip()
+            title = str(entry.get("title") or "").strip()
+            if not quest_id or not title:
+                log.warning("quest_add entry skipped (quest_id and title required): %r", entry)
+                continue
+            description = str(entry.get("description") or "").strip()
+            status = str(entry.get("status") or "active").strip() or "active"
+            state_mgr.upsert_quest(player_id, quest_id, title, description, status)
+            log.info("quest_add %s (%s) for player %s", quest_id, status, player_id)
+
+
+def parse_and_apply_mutations(
+    narrative_response: str,
+    player_id: str,
+    state_mgr: "StateManager",
+) -> str:
+    """Apply any ``<state_update>`` block(s) and return the cleaned narrative.
+
+    1. Locates every ``<state_update>...</state_update>`` block via regex.
+    2. Parses each payload as JSON and applies ``hp_change`` /
+       ``inventory_add`` / ``inventory_remove`` / ``quest_updates`` /
+       ``quest_add`` through StateManager (``quest_updates`` entries call
+       ``update_quest_status``; ``quest_add`` entries call ``upsert_quest``).
+    3. Returns the narrative with all blocks removed and trimmed.
+
+    Malformed JSON blocks are logged and skipped, but the block is still
+    stripped from the user-visible narrative. A response with no block is
+    returned unchanged (aside from trimming).
+    """
+    if not narrative_response:
+        return ""
+    matches = list(STATE_UPDATE_PATTERN.finditer(narrative_response))
+    for match in matches:
+        payload = _loads_json_block(match.group("payload"))
+        if payload is None:
+            continue
+        _apply_mutations(payload, player_id, state_mgr)
+    return STATE_UPDATE_PATTERN.sub("", narrative_response).strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -374,7 +616,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="KrckRP Orchestrator",
         description="FastAPI engine wiring SQLite hard state + ChromaDB lore RAG to a local KoboldCpp LLM.",
-        version="0.1.0",
+        version="0.2.0",
     )
 
     @app.get("/health")
@@ -386,6 +628,7 @@ def create_app() -> FastAPI:
             "model": KOBOLD_MODEL,
             "state_db": STATE_DB_PATH,
             "chroma_db": CHROMA_DB_PATH,
+            "chroma_collection": CHROMA_COLLECTION,
             "embedding_model": EMBEDDING_MODEL,
         }
 
@@ -428,10 +671,19 @@ def create_app() -> FastAPI:
             log.warning("Lore retrieval failed; narrating with state only: %s", exc)
             lore = []
 
-        # 3) Prompt + LLM ---------------------------------------------------
-        messages = build_messages(state, lore, req.action_text)
+        # 3) Chat history (sliding window) ----------------------------------
+        chat_history = state_mgr.get_recent_chat(req.player_id, limit=RECENT_CHAT_LIMIT)
+
+        # 4) Prompt + LLM ---------------------------------------------------
+        messages = build_messages(
+            state,
+            lore,
+            req.action_text,
+            chat_history=chat_history,
+            temperature=LLM_TEMPERATURE,
+        )
         try:
-            narrative = llm.complete(messages)
+            raw_narrative = llm.complete(messages, temperature=LLM_TEMPERATURE)
         except httpx.HTTPError as exc:
             log.error("KoboldCpp request failed: %s", exc)
             raise HTTPException(
@@ -442,11 +694,19 @@ def create_app() -> FastAPI:
             log.error("LLM call failed: %s", exc)
             raise HTTPException(status_code=502, detail=f"LLM call failed: {exc}") from exc
 
-        # 4) Respond --------------------------------------------------------
+        # 5) Apply state mutations + clean the narrative -------------------
+        narrative = parse_and_apply_mutations(raw_narrative, req.player_id, state_mgr)
+
+        # 6) Persist the turn: the user's action, then the cleaned GM reply -
+        state_mgr.append_chat_turn(req.player_id, "user", req.action_text)
+        state_mgr.append_chat_turn(req.player_id, "assistant", narrative)
+
+        # 7) Respond with the freshly updated state -------------------------
+        fresh_state = state_mgr.get_player_state(req.player_id)
         return PlayerActionResponse(
             narrative_response=narrative,
             retrieved_lore=lore,
-            current_state=state,
+            current_state=fresh_state if fresh_state is not None else state,
         )
 
     return app

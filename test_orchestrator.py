@@ -37,11 +37,12 @@ from orchestrator import (  # noqa: E402
     KOBOLD_BASE_URL,
     KOBOLD_MODEL,
     LLMClient,
-    build_messages,
     app,
+    build_messages,
     get_llm_client,
     get_lore_manager,
     get_state_manager,
+    parse_and_apply_mutations,
 )
 
 CANNED_NARRATIVE = (
@@ -93,15 +94,37 @@ def _sample_lore() -> list[dict[str, Any]]:
 
 
 class FakeState:
-    """Duck-typed stand-in for StateManager (only get_player_state is used)."""
+    """Duck-typed stand-in for StateManager (implements every method the
+    endpoint and the mutation parser call)."""
 
     def __init__(self, state: dict[str, Any] | None) -> None:
         self._state = state
         self.last_player: str | None = None
+        self.chat_turns: list[tuple[str, str, str]] = []
+        self.hp_updates: list[tuple[str, int]] = []
+        self.inventory_adds: list[tuple[str, str, str, int]] = []
+        self.inventory_removes: list[tuple[str, str]] = []
 
     def get_player_state(self, player_id: str) -> dict[str, Any] | None:
         self.last_player = player_id
         return self._state if self._state and self._state.get("player_id") == player_id else None
+
+    def get_recent_chat(self, player_id: str, limit: int = 15) -> list[dict[str, str]]:
+        return []
+
+    def append_chat_turn(self, player_id: str, role: str, content: str) -> None:
+        self.chat_turns.append((player_id, role, content))
+
+    def update_player_hp(self, player_id: str, hp_change: int) -> None:
+        self.hp_updates.append((player_id, hp_change))
+
+    def upsert_inventory_item(
+        self, item_id: str, owner_id: str, item_name: str, quantity: int
+    ) -> None:
+        self.inventory_adds.append((item_id, owner_id, item_name, quantity))
+
+    def remove_inventory_item(self, item_id: str, owner_id: str) -> None:
+        self.inventory_removes.append((item_id, owner_id))
 
 
 class FakeLore:
@@ -191,6 +214,87 @@ def test_build_messages_tolerates_missing_location_and_empty_lore() -> None:
     assert "10/10" in system
     assert "no lore retrieved" in system
     print("[PASS] build_messages tolerates missing location + empty lore")
+
+
+def test_build_messages_splices_chat_history() -> None:
+    state = _sample_state("kaelen")
+    history = [
+        {"role": "user", "content": "I search the reeds."},
+        {"role": "assistant", "content": "You find a rusted key."},
+        {"role": "system", "content": "should be dropped"},   # invalid role
+        {"role": "user", "content": "   "},                  # blank content
+    ]
+    messages = build_messages(state, _sample_lore(), "I head north.", chat_history=history)
+    roles = [m["role"] for m in messages]
+    assert roles == ["system", "user", "assistant", "user"], roles
+    assert messages[1]["content"] == "I search the reeds."
+    assert messages[2]["content"] == "You find a rusted key."
+    assert "I head north." in messages[3]["content"]
+    print("[PASS] build_messages splices valid chat history between system and action")
+
+
+def test_parse_and_apply_mutations_applies_and_cleans() -> None:
+    fake = FakeState(_sample_state("kaelen"))
+    narrative = (
+        "The warden's bell cracks across your skull. You stumble, bleeding into the murk.\n\n"
+        '<state_update>{"hp_change": -5, '
+        '"inventory_add": [{"item_id": "torch_2", "item_name": "Torch", "quantity": 1}], '
+        '"inventory_remove": ["potion_1"]}</state_update>'
+    )
+    cleaned = parse_and_apply_mutations(narrative, "kaelen", fake)
+
+    assert "<state_update>" not in cleaned
+    assert "bleeding into the murk" in cleaned
+    assert fake.hp_updates == [("kaelen", -5)]
+    assert fake.inventory_adds == [("torch_2", "kaelen", "Torch", 1)]
+    assert fake.inventory_removes == [("potion_1", "kaelen")]
+    print("[PASS] parse_and_apply_mutations applies hp/inventory mutations + cleans narrative")
+
+
+def test_parse_and_apply_mutations_no_block_and_malformed() -> None:
+    fake = FakeState(_sample_state("kaelen"))
+    assert parse_and_apply_mutations("Plain prose.", "kaelen", fake) == "Plain prose."
+    assert fake.hp_updates == [] and fake.inventory_adds == [] and fake.inventory_removes == []
+
+    fake2 = FakeState(_sample_state("kaelen"))
+    cleaned = parse_and_apply_mutations(
+        "before <state_update>{not valid json</state_update> after", "kaelen", fake2
+    )
+    assert "<state_update>" not in cleaned
+    assert "before" in cleaned and "after" in cleaned
+    assert fake2.hp_updates == [] and fake2.inventory_adds == [] and fake2.inventory_removes == []
+    print("[PASS] parser no-ops without a block; malformed JSON skipped but still cleaned")
+
+
+def test_full_pipeline_applies_state_update_and_persists_chat() -> None:
+    state = _sample_state("kaelen")
+    fake_state = FakeState(state)
+    fake_lore = FakeLore(_sample_lore())
+    block = '<state_update>{"hp_change": -3}</state_update>'
+    captured: dict[str, Any] = {}
+    fake_llm = _llm_client_capturing(captured, narrative=CANNED_NARRATIVE + "\n\n" + block)
+
+    _override(fake_state, fake_lore, fake_llm)
+    try:
+        client = TestClient(app)
+        resp = client.post(
+            "/api/action",
+            json={"player_id": "kaelen", "action_text": "I draw my blade and charge the Brotherhood warden."},
+        )
+    finally:
+        _reset_overrides()
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # The block is stripped from the user-facing narrative.
+    assert "<state_update>" not in body["narrative_response"]
+    assert body["narrative_response"].endswith("slip away?")
+    # The mutation went through the StateManager interface.
+    assert fake_state.hp_updates == [("kaelen", -3)]
+    # Both chat turns persisted, the user's action first.
+    assert [role for (_p, role, _c) in fake_state.chat_turns] == ["user", "assistant"]
+    assert fake_state.chat_turns[0][2] == "I draw my blade and charge the Brotherhood warden."
+    print("[PASS] full pipeline: <state_update> applied, narrative cleaned, chat persisted")
 
 
 def test_full_pipeline_success() -> None:
@@ -316,7 +420,11 @@ def _run_mock_tests() -> int:
     tests = [
         test_build_messages_contains_state_lore_and_action,
         test_build_messages_tolerates_missing_location_and_empty_lore,
+        test_build_messages_splices_chat_history,
+        test_parse_and_apply_mutations_applies_and_cleans,
+        test_parse_and_apply_mutations_no_block_and_malformed,
         test_full_pipeline_success,
+        test_full_pipeline_applies_state_update_and_persists_chat,
         test_pipeline_falls_back_to_global_lore_when_scoped_empty,
         test_pipeline_player_not_found_returns_404,
         test_pipeline_llm_failure_returns_502,
