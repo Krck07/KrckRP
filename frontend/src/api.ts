@@ -15,7 +15,10 @@ const API_BASE_URL = "http://localhost:8000";
 // Types — mirror the orchestrator's Pydantic models and StateManager schema
 // ---------------------------------------------------------------------------
 
-/** Players table: {id, name, hp, max_hp, level, current_location_id} */
+/**
+ * Players table: {id, name, hp, max_hp, level, current_location_id,
+ * resource_name, current_resource, max_resource}
+ */
 export interface Player {
   id: string;
   name: string;
@@ -23,6 +26,12 @@ export interface Player {
   max_hp: number;
   level: number;
   current_location_id: string | null;
+  /** Label of the player's primary resource pool (e.g. "Stamina", "Mana", "Focus", "Tech-Charges"). */
+  resource_name: string;
+  /** Current value of the primary resource (server clamps to [0, max_resource]). */
+  current_resource: number;
+  /** Maximum value of the primary resource pool. */
+  max_resource: number;
 }
 
 /** Locations table: {id, name, base_description} */
@@ -54,6 +63,14 @@ export interface Quest {
   status: string;
 }
 
+/** Abilities table: {ability_id, player_id, name, resource_cost} */
+export interface Ability {
+  ability_id: string;
+  name: string;
+  /** Primary resource spent when the ability is used. */
+  resource_cost: number;
+}
+
 /**
  * The consolidated state dict returned by StateManager.get_player_state()
  * and echoed back (freshly re-read) as `current_state` in every response.
@@ -63,6 +80,7 @@ export interface GameState {
   location: Location | null;
   npcs_here: NPCHere[];
   inventory: InventoryItem[];
+  abilities: Ability[];
   quests: Quest[];
 }
 
@@ -80,7 +98,7 @@ export interface PlayerActionResponse {
   narrative_response: string;
   /** Lore snippets retrieved for this action (most similar first). */
   retrieved_lore: RetrievedLore[];
-  /** Freshly re-read hard state (player, location, npcs_here, inventory, quests). */
+  /** Freshly re-read hard state (player, location, npcs_here, inventory, abilities, quests). */
   current_state: GameState;
 }
 

@@ -8,8 +8,12 @@
  * each is exported alongside the container so they can be reused or tested in
  * isolation:
  *
- *   Stats      — name, level, a colour-coded health bar (hp / max_hp),
- *                and the current location name directly below the stats
+ *   Stats            — name, level, a colour-coded health bar (hp / max_hp),
+ *                      and the current location name directly below the stats
+ *   ResourceAbilities— dynamic progress bar for the primary resource
+ *                      (labelled from player.resource_name, e.g. "Stamina 85/100")
+ *                      plus an itemized list of known abilities (name + cost),
+ *                      or a "No skills acquired yet" placeholder
  *   Inventory  — item grid (name + quantity), or a stylized empty state
  *   Quests     — title / description / status; "active" vs "completed" styled
  *                apart (bright marker vs dimmed + strikethrough + checkmark)
@@ -27,6 +31,7 @@
 import { type ReactNode } from "react";
 import { useGameState } from "./GameStateContext";
 import type {
+  Ability,
   InventoryItem,
   Location,
   NPCHere,
@@ -190,6 +195,88 @@ export function Stats({
           </div>
         </div>
       </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Resource & Abilities
+// ---------------------------------------------------------------------------
+
+/**
+ * The universal resource system at a glance: a dynamic progress bar for the
+ * player's primary resource (labelled from `player.resource_name` — Stamina,
+ * Mana, Focus, Tech-Charges — with current / max values), followed by an
+ * itemized list of every known ability (name + resource_cost chip), or a
+ * "No skills acquired yet" placeholder when the abilities array is empty.
+ */
+export function ResourceAbilities({
+  player,
+  abilities,
+}: {
+  player: Player;
+  abilities: Ability[];
+}) {
+  const fraction = healthFraction(player.current_resource, player.max_resource);
+  const percent = Math.round(fraction * 100);
+  // Keep a visible sliver while the pool is above zero; fully empty when drained.
+  const barWidth = player.current_resource > 0 ? Math.max(3, percent) : 0;
+
+  return (
+    <section aria-label="Resource and abilities" className="space-y-3">
+      <PanelTitle>Resource &amp; Abilities</PanelTitle>
+
+      {/* Primary resource bar — label and values come from the player state */}
+      <div>
+        <div className="flex items-center justify-between text-xs">
+          <span className="font-semibold uppercase tracking-[0.2em] text-stone-400">
+            {player.resource_name}
+          </span>
+          <span className="tabular-nums text-stone-300">
+            {player.current_resource} / {player.max_resource}
+          </span>
+        </div>
+        <div
+          role="progressbar"
+          aria-label={player.resource_name}
+          aria-valuenow={player.current_resource}
+          aria-valuemin={0}
+          aria-valuemax={player.max_resource}
+          aria-valuetext={`${player.current_resource} of ${player.max_resource} ${player.resource_name}`}
+          className="mt-1.5 h-3 overflow-hidden rounded-full border border-stone-700/70 bg-stone-900"
+        >
+          <div
+            className={`h-full rounded-full transition-all duration-500 ease-out ${healthBarColor(fraction)}`}
+            style={{ width: `${barWidth}%` }}
+          />
+        </div>
+      </div>
+
+      {/* Known abilities, or the empty state */}
+      {abilities.length === 0 ? (
+        <EmptyNote>
+          No skills acquired yet
+          <span className="mt-1 block text-xs not-italic text-stone-500">
+            Your hands still remember only the basics.
+          </span>
+        </EmptyNote>
+      ) : (
+        <ul className="space-y-2">
+          {abilities.map((ability) => (
+            <li
+              key={ability.ability_id}
+              className="flex items-center justify-between gap-3 rounded-lg border border-stone-800 bg-stone-900/60 px-3 py-2.5"
+            >
+              <span className="min-w-0 truncate font-serif text-sm text-stone-100">
+                {ability.name}
+              </span>
+              <span className="shrink-0 rounded-md border border-cyan-700/50 bg-cyan-950/40 px-2 py-1 text-xs font-semibold tabular-nums text-cyan-300">
+                {ability.resource_cost} {player.resource_name}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }
@@ -401,7 +488,7 @@ export function Sidebar() {
     );
   }
 
-  const { player, location, inventory, quests, npcs_here } = activeState;
+  const { player, location, inventory, abilities, quests, npcs_here } = activeState;
 
   return (
     <aside aria-label="Character sidebar" className={shell}>
@@ -421,6 +508,7 @@ export function Sidebar() {
 
       <div className="flex-1 space-y-6 overflow-y-auto px-5 py-5">
         <Stats player={player} location={location} />
+        <ResourceAbilities player={player} abilities={abilities} />
         <Inventory items={inventory} />
         <Quests quests={quests} />
         <NpcsHere npcs={npcs_here} />

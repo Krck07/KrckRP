@@ -55,7 +55,8 @@ export interface GameStateContextValue {
 
   /**
    * Nested hard state from the backend:
-   * { player, location, npcs_here, inventory, quests }.
+   * { player (incl. resource_name / current_resource / max_resource),
+   *   location, npcs_here, inventory, abilities, quests }.
    * null until the first successful action.
    */
   activeState: GameState | null;

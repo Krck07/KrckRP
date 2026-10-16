@@ -56,22 +56,37 @@ CANNED_NARRATIVE = (
 # Fakes
 # --------------------------------------------------------------------------- #
 def _sample_state(player_id: str) -> dict[str, Any]:
+    """Fake state in the EXACT nested shape of StateManager.get_player_state():
+    stats under ``player``, location under ``location``, co-located NPCs under
+    ``npcs_here``, plus ``inventory`` and ``quests`` at the top level."""
     return {
-        "player_id": player_id,
-        "name": "Kaelen",
-        "hp": 42,
-        "max_hp": 60,
-        "level": 5,
-        "current_location_id": "oakhaven_swamp",
+        "player": {
+            "id": player_id,
+            "name": "Kaelen",
+            "hp": 42,
+            "max_hp": 60,
+            "level": 5,
+            "current_location_id": "oakhaven_swamp",
+        },
         "location": {
-            "location_id": "oakhaven_swamp",
+            "id": "oakhaven_swamp",
             "name": "Oakhaven Swamp",
             "base_description": "A fog-choked marsh of black water and dead cypress.",
         },
-        "npcs": [{"name": "Vaelen", "disposition_score": -3}],
+        "npcs_here": [
+            {"id": "vaelen", "name": "Vaelen", "disposition_score": -3},
+        ],
         "inventory": [
-            {"item_id": "torch_1", "owner_id": player_id, "item_name": "Torch", "quantity": 1},
-            {"item_id": "potion_1", "owner_id": player_id, "item_name": "Healing Potion", "quantity": 2},
+            {"item_id": "torch_1", "item_name": "Torch", "quantity": 1},
+            {"item_id": "potion_1", "item_name": "Healing Potion", "quantity": 2},
+        ],
+        "quests": [
+            {
+                "quest_id": "swamp_mystery",
+                "title": "The Swamp's Mystery",
+                "description": "Learn why the Brotherhood's iron bells toll for the dead.",
+                "status": "active",
+            },
         ],
     }
 
@@ -102,12 +117,23 @@ class FakeState:
         self.last_player: str | None = None
         self.chat_turns: list[tuple[str, str, str]] = []
         self.hp_updates: list[tuple[str, int]] = []
+        self.resource_updates: list[tuple[str, int]] = []
+        self.ability_adds: list[tuple[str, str, str, int]] = []
         self.inventory_adds: list[tuple[str, str, str, int]] = []
         self.inventory_removes: list[tuple[str, str]] = []
 
     def get_player_state(self, player_id: str) -> dict[str, Any] | None:
         self.last_player = player_id
-        return self._state if self._state and self._state.get("player_id") == player_id else None
+        if self._state is None:
+            return None
+        # Nested shape (get_player_state()): player id lives under state["player"]["id"].
+        player = self._state.get("player")
+        if isinstance(player, dict) and player.get("id") == player_id:
+            return self._state
+        # Tolerate a flat state dict (legacy shape) as a fallback.
+        if self._state.get("player_id") == player_id:
+            return self._state
+        return None
 
     def get_recent_chat(self, player_id: str, limit: int = 15) -> list[dict[str, str]]:
         return []
@@ -117,6 +143,18 @@ class FakeState:
 
     def update_player_hp(self, player_id: str, hp_change: int) -> None:
         self.hp_updates.append((player_id, hp_change))
+
+    def update_player_resource(self, player_id: str, change: int) -> None:
+        self.resource_updates.append((player_id, change))
+
+    def upsert_ability(
+        self,
+        player_id: str,
+        ability_id: str,
+        name: str,
+        resource_cost: int,
+    ) -> None:
+        self.ability_adds.append((player_id, ability_id, name, resource_cost))
 
     def upsert_inventory_item(
         self, item_id: str, owner_id: str, item_name: str, quantity: int
@@ -324,8 +362,8 @@ def test_full_pipeline_success() -> None:
     # Response shape
     assert body["narrative_response"] == CANNED_NARRATIVE
     assert body["retrieved_lore"] == _sample_lore()
-    assert body["current_state"]["hp"] == 42
-    assert body["current_state"]["level"] == 5
+    assert body["current_state"]["player"]["hp"] == 42
+    assert body["current_state"]["player"]["level"] == 5
 
     # The real LLMClient hit the right endpoint with the right model + messages.
     assert captured["url"].endswith("/v1/chat/completions"), captured["url"]

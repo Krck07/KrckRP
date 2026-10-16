@@ -20,7 +20,10 @@ CREATE TABLE IF NOT EXISTS Players (
     hp                  INTEGER NOT NULL,
     max_hp              INTEGER NOT NULL,
     level               INTEGER NOT NULL DEFAULT 1,
-    current_location_id TEXT REFERENCES Locations(id)
+    current_location_id TEXT REFERENCES Locations(id),
+    resource_name       TEXT    NOT NULL DEFAULT 'Stamina',
+    current_resource    INTEGER NOT NULL DEFAULT 100,
+    max_resource        INTEGER NOT NULL DEFAULT 100
 );
 
 CREATE TABLE IF NOT EXISTS NPCs (
@@ -52,6 +55,14 @@ CREATE TABLE IF NOT EXISTS Quests (
     PRIMARY KEY (quest_id, player_id)
 );
 
+CREATE TABLE IF NOT EXISTS Abilities (
+    ability_id    TEXT NOT NULL,
+    player_id     TEXT NOT NULL REFERENCES Players(id),
+    name          TEXT NOT NULL,
+    resource_cost INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (ability_id, player_id)
+);
+
 CREATE TABLE IF NOT EXISTS ChatHistory (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     player_id TEXT NOT NULL,
@@ -63,18 +74,42 @@ CREATE INDEX IF NOT EXISTS idx_npcs_location ON NPCs (location_id);
 CREATE INDEX IF NOT EXISTS idx_inventory_owner ON Inventory (owner_id);
 CREATE INDEX IF NOT EXISTS idx_quests_player ON Quests (player_id);
 CREATE INDEX IF NOT EXISTS idx_chat_history_player ON ChatHistory (player_id, id);
+CREATE INDEX IF NOT EXISTS idx_abilities_player ON Abilities (player_id);
 """
+
+# Resource columns added in place to Players tables created before the
+# universal resource system existed (see StateManager._migrate_resource_columns).
+_PLAYER_RESOURCE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("resource_name", "TEXT NOT NULL DEFAULT 'Stamina'"),
+    ("current_resource", "INTEGER NOT NULL DEFAULT 100"),
+    ("max_resource", "INTEGER NOT NULL DEFAULT 100"),
+)
 
 
 class StateManager:
     """Persistent SQLite store for hard game state, with per-call safe connections."""
 
     def __init__(self, db_path: str = "game_state.db") -> None:
-        """Connect to `db_path` (creating the file if missing) and create all tables if absent."""
+        """Connect to `db_path` (creating the file if missing) and create all tables if absent.
+
+        Databases created before the universal resource system are migrated in
+        place: the three resource columns are added to an existing Players
+        table, and the Abilities table is created by the schema script above.
+        """
         self._db_path = db_path
         with closing(sqlite3.connect(self._db_path)) as conn:
             conn.execute("PRAGMA foreign_keys = ON")
             conn.executescript(_SCHEMA)
+            self._migrate_resource_columns(conn)
+            conn.commit()
+
+    @staticmethod
+    def _migrate_resource_columns(conn: sqlite3.Connection) -> None:
+        """Add the resource columns to a Players table that predates them (no-op when present)."""
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(Players)")}
+        for column, declaration in _PLAYER_RESOURCE_COLUMNS:
+            if column not in existing:
+                conn.execute(f"ALTER TABLE Players ADD COLUMN {column} {declaration}")
 
     # ------------------------------------------------------------------ upserts
 
@@ -175,7 +210,7 @@ class StateManager:
         status: str,
     ) -> None:
         """Insert a Quest row, or update title/description/status when (quest_id, player_id) already exists."""
-        with sqlite3.connect(self._db_path) as conn:
+        with closing(sqlite3.connect(self._db_path)) as conn, conn:
             conn.execute(
                 """
                 INSERT INTO Quests (quest_id, player_id, title, description, status)
@@ -190,21 +225,45 @@ class StateManager:
 
     def update_quest_status(self, player_id: str, quest_id: str, status: str) -> None:
         """Advance a quest's status without touching title/description (no-op if absent)."""
-        with sqlite3.connect(self._db_path) as conn:
+        with closing(sqlite3.connect(self._db_path)) as conn, conn:
             conn.execute(
                 "UPDATE Quests SET status = ? WHERE quest_id = ? AND player_id = ?",
                 (status, quest_id, player_id),
             )
 
+    # --------------------------------------------------------------- abilities
+
+    def upsert_ability(
+        self,
+        player_id: str,
+        ability_id: str,
+        name: str,
+        resource_cost: int,
+    ) -> None:
+        """Insert an Ability row, or update name/resource_cost when (ability_id, player_id) already exists."""
+        with closing(sqlite3.connect(self._db_path)) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO Abilities (ability_id, player_id, name, resource_cost)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(ability_id, player_id) DO UPDATE SET
+                    name = excluded.name,
+                    resource_cost = excluded.resource_cost
+                """,
+                (ability_id, player_id, name, resource_cost),
+            )
+
     # ---------------------------------------------------------------- retrieval
 
     def get_player_state(self, player_id: str) -> Optional[dict[str, Any]]:
-        """Return one consolidated dict: player stats, current location, NPCs there, inventory, and quests (None if the player is missing)."""
+        """Return one consolidated dict: player stats (incl. the universal resource pool),
+        current location, NPCs there, inventory, abilities, and quests (None if the player is missing)."""
         with closing(sqlite3.connect(self._db_path)) as conn:
             conn.row_factory = sqlite3.Row
 
             player = conn.execute(
-                "SELECT id, name, hp, max_hp, level, current_location_id "
+                "SELECT id, name, hp, max_hp, level, current_location_id, "
+                "resource_name, current_resource, max_resource "
                 "FROM Players WHERE id = ?",
                 (player_id,),
             ).fetchone()
@@ -252,6 +311,15 @@ class StateManager:
                 )
             ]
 
+            abilities = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT ability_id, name, resource_cost FROM Abilities "
+                    "WHERE player_id = ? ORDER BY name",
+                    (player_id,),
+                )
+            ]
+
         return {
             "player": {
                 "id": player["id"],
@@ -260,10 +328,14 @@ class StateManager:
                 "max_hp": player["max_hp"],
                 "level": player["level"],
                 "current_location_id": location_id,
+                "resource_name": player["resource_name"],
+                "current_resource": player["current_resource"],
+                "max_resource": player["max_resource"],
             },
             "location": location,
             "npcs_here": npcs_here,
             "inventory": inventory,
+            "abilities": abilities,
             "quests": quests,
         }
 
@@ -302,6 +374,20 @@ class StateManager:
             conn.execute(
                 "UPDATE Players SET hp = MAX(0, MIN(max_hp, hp + ?)) WHERE id = ?",
                 (hp_change, player_id),
+            )
+
+    def update_player_resource(self, player_id: str, change: int) -> None:
+        """Apply a relative resource delta atomically, clamped to [0, max_resource].
+
+        Mirrors :meth:`update_player_hp`: a single UPDATE
+        (MAX(0, MIN(max_resource, current_resource + ?))) — no read-modify-write
+        race. No-op if the player id does not exist.
+        """
+        with closing(sqlite3.connect(self._db_path)) as conn, conn:
+            conn.execute(
+                "UPDATE Players SET current_resource = MAX(0, MIN(max_resource, current_resource + ?)) "
+                "WHERE id = ?",
+                (change, player_id),
             )
 
     def remove_inventory_item(self, item_id: str, owner_id: str) -> None:

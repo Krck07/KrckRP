@@ -33,9 +33,10 @@ Design notes
   (:func:`parse_and_apply_mutations`) are pure functions of their inputs and
   can be unit-tested in isolation.
 * The GM system prompt is **external**: loaded from ``system_prompts.json``
-  (``base_dm_rules`` + ``combat_rules`` + ``formatting_instructions``) into the
-  module-level ``SYSTEM_PROMPTS`` dict at import time, so the persona, combat
-  handling, and the ``<state_update>`` protocol can be tuned without code
+  (``base_dm_rules`` + ``combat_rules`` + ``resource_rules`` +
+  ``formatting_instructions``) into the module-level ``SYSTEM_PROMPTS`` dict
+  at import time, so the persona, combat handling, the skills/resource
+  economy, and the ``<state_update>`` protocol can be tuned without code
   changes.
 """
 
@@ -246,14 +247,20 @@ def get_llm_client() -> LLMClient:
 # --------------------------------------------------------------------------- #
 # External system prompt configuration (system_prompts.json)
 # --------------------------------------------------------------------------- #
-SYSTEM_PROMPT_KEYS: tuple[str, ...] = ("base_dm_rules", "combat_rules", "formatting_instructions")
+SYSTEM_PROMPT_KEYS: tuple[str, ...] = (
+    "base_dm_rules",
+    "combat_rules",
+    "resource_rules",
+    "formatting_instructions",
+)
 
 
 def _load_system_prompts(path: str = SYSTEM_PROMPTS_PATH) -> dict[str, str]:
     """Load the external GM prompt configuration from a JSON file.
 
     Expects a single JSON object with the non-empty string keys
-    ``base_dm_rules``, ``combat_rules`` and ``formatting_instructions``.
+    ``base_dm_rules``, ``combat_rules``, ``resource_rules`` and
+    ``formatting_instructions``.
     Raises :class:`RuntimeError` with a clear message when the file is
     missing, unparseable, or incomplete, so a broken configuration fails
     loudly at startup instead of mid-request.
@@ -264,7 +271,7 @@ def _load_system_prompts(path: str = SYSTEM_PROMPTS_PATH) -> dict[str, str]:
     except FileNotFoundError:
         raise RuntimeError(
             f"System prompt config not found at {path!r}. Create a JSON object with "
-            "the keys: base_dm_rules, combat_rules, formatting_instructions "
+            "the keys: base_dm_rules, combat_rules, resource_rules, formatting_instructions "
             "(or set SYSTEM_PROMPTS_PATH)."
         ) from None
     except json.JSONDecodeError as exc:
@@ -331,6 +338,23 @@ def _format_quests(quests: Any) -> str:
     return "\n".join(lines) if lines else "  (no active quests)"
 
 
+def _format_abilities(abilities: Any, resource_label: str = "resource") -> str:
+    if not abilities:
+        return "  (no skills acquired yet)"
+    lines = []
+    for ability in abilities:
+        if isinstance(ability, dict):
+            name = _pick(ability, "name", "ability_name") or _pick(ability, "ability_id", "id")
+            cost = ability.get("resource_cost", ability.get("cost"))
+            line = f"  - {name or 'Unknown ability'}"
+            if cost is not None:
+                line += f" ({resource_label} cost: {cost})"
+            lines.append(line)
+        else:
+            lines.append(f"  - {ability}")
+    return "\n".join(lines) if lines else "  (no skills acquired yet)"
+
+
 def _format_npcs(npcs: Any) -> str:
     if not npcs:
         return "  (no NPCs present)"
@@ -353,9 +377,9 @@ def format_state_for_prompt(state: dict[str, Any]) -> str:
 
     Targets the StateManager.get_player_state() shape: player stats live in
     the nested ``player`` dict (``state["player"]["name" / "hp" / "max_hp" /
-    "level"]``), while location, npcs_here, inventory, and quests are
-    top-level keys. A flat dict (stats at the top level) is still tolerated
-    as a fallback.
+    "level" / "resource_name" / "current_resource" / "max_resource"]``), while
+    location, npcs_here, inventory, abilities, and quests are top-level keys.
+    A flat dict (stats at the top level) is still tolerated as a fallback.
     """
     player = state.get("player")
     if not isinstance(player, dict):
@@ -365,6 +389,10 @@ def format_state_for_prompt(state: dict[str, Any]) -> str:
     hp = _pick(player, "hp", "current_hp")
     max_hp = _pick(player, "max_hp", "maximum_hp", "maxHp")
     level = _pick(player, "level", "player_level")
+    resource_name = _pick(player, "resource_name") or "Stamina"
+    resource = _pick(player, "current_resource")
+    max_resource = _pick(player, "max_resource")
+    abilities = state.get("abilities") or player.get("abilities")
 
     location = state.get("location")
     if not isinstance(location, dict):
@@ -379,11 +407,17 @@ def format_state_for_prompt(state: dict[str, Any]) -> str:
     hp_text = f"{hp}/{max_hp}" if hp is not None and max_hp is not None else (
         f"{hp}" if hp is not None else "unknown"
     )
+    resource_text = (
+        f"{resource_name} {resource}/{max_resource}"
+        if resource is not None and max_resource is not None
+        else (f"{resource_name} {resource}" if resource is not None else f"{resource_name} unknown")
+    )
 
     parts = [
         f"  Player: {name or 'Unknown'}",
         f"  HP: {hp_text}",
         f"  Level: {level if level is not None else 'unknown'}",
+        f"  Primary Resource: {resource_text}",
         f"  Location: {loc_name or 'Unknown'}" + (f" (id: {loc_id})" if loc_id else ""),
         "",
         "  Co-located NPCs:",
@@ -391,6 +425,9 @@ def format_state_for_prompt(state: dict[str, Any]) -> str:
         "",
         "  Inventory:",
         _format_inventory(state.get("inventory") or state.get("items") or state.get("inv")),
+        "",
+        f"  Known Abilities (each spends {resource_name} to use):",
+        _format_abilities(abilities, resource_name),
         "",
         "  Quests:",
         _format_quests(state.get("quests")),
@@ -423,15 +460,17 @@ def build_messages(
     lore: list[dict[str, Any]],
     action_text: str,
     chat_history: Optional[list[dict[str, str]]] = None,
-    temperature: float = LLM_TEMPERATURE,
 ) -> list[dict[str, str]]:
     """Assemble the OpenAI-style prompt from state + lore + recent chat + action.
 
     Message order:
       1. ``system``  — GM instructions loaded from ``system_prompts.json``
-         (``base_dm_rules`` + ``combat_rules`` + ``formatting_instructions``,
-         the last carrying the State Mutation Protocol incl. ``quest_updates``),
-         then the authoritative SQLite state and the retrieved ChromaDB lore.
+         (``base_dm_rules`` + ``combat_rules`` + ``resource_rules`` +
+         ``formatting_instructions``, the last carrying the State Mutation
+         Protocol incl. ``resource_change``, ``ability_add`` and
+         ``quest_updates``), then the authoritative SQLite state (incl. the
+         primary resource pool and known abilities) and the retrieved
+         ChromaDB lore.
       2. recent chat turns (sliding window, oldest-first) — each validated to a
          ``user``/``assistant`` role with non-empty content.
       3. ``user``    — the player's current action.
@@ -439,6 +478,7 @@ def build_messages(
     system_parts = [
         SYSTEM_PROMPTS["base_dm_rules"],
         SYSTEM_PROMPTS["combat_rules"],
+        SYSTEM_PROMPTS["resource_rules"],
         SYSTEM_PROMPTS["formatting_instructions"],
         "\n## CURRENT WORLD STATE (authoritative -- apply changes only via the State Mutation Protocol)\n"
         + format_state_for_prompt(state),
@@ -509,11 +549,15 @@ def _loads_json_block(raw: str) -> Optional[dict[str, Any]]:
 def _apply_mutations(payload: dict[str, Any], player_id: str, state_mgr) -> None:
     """Apply one parsed <state_update> payload through StateManager methods.
 
-    Handles ``hp_change``, ``inventory_add``, ``inventory_remove``,
-    ``quest_updates`` (each {"quest_id", "status"} entry advances an existing
-    quest via :meth:`StateManager.update_quest_status`), and ``quest_add``
-    (each {"quest_id", "title", "description", "status"} entry creates or
-    refreshes a quest via :meth:`StateManager.upsert_quest`).
+    Handles ``hp_change``, ``resource_change`` (relative delta applied via
+    :meth:`StateManager.update_player_resource`, clamped to
+    ``[0, max_resource]``), ``ability_add`` (each {"ability_id", "name",
+    "resource_cost"} entry grants/refreshes a skill via
+    :meth:`StateManager.upsert_ability`), ``inventory_add``,
+    ``inventory_remove``, ``quest_updates`` (each {"quest_id", "status"} entry
+    advances an existing quest via :meth:`StateManager.update_quest_status`),
+    and ``quest_add`` (each {"quest_id", "title", "description", "status"}
+    entry creates or refreshes a quest via :meth:`StateManager.upsert_quest`).
     """
     hp_change = payload.get("hp_change")
     if isinstance(hp_change, bool):
@@ -523,6 +567,31 @@ def _apply_mutations(payload: dict[str, Any], player_id: str, state_mgr) -> None
         if delta:
             state_mgr.update_player_hp(player_id, delta)
             log.info("hp_change %+d applied to player %s", delta, player_id)
+
+    resource_change = payload.get("resource_change")
+    if isinstance(resource_change, bool):
+        resource_change = None
+    if isinstance(resource_change, (int, float)):
+        delta = int(resource_change)
+        if delta:
+            state_mgr.update_player_resource(player_id, delta)
+            log.info("resource_change %+d applied to player %s", delta, player_id)
+
+    ability_adds = payload.get("ability_add")
+    if isinstance(ability_adds, list):
+        for entry in ability_adds:
+            if not isinstance(entry, dict):
+                continue
+            ability_id = str(entry.get("ability_id") or "").strip()
+            ability_name = str(entry.get("name") or ability_id).strip()
+            if not ability_id:
+                continue
+            try:
+                resource_cost = max(0, int(entry.get("resource_cost", 0)))
+            except (TypeError, ValueError):
+                resource_cost = 0
+            state_mgr.upsert_ability(player_id, ability_id, ability_name, resource_cost)
+            log.info("ability_add %s (%s, cost %d) for player %s", ability_id, ability_name, resource_cost, player_id)
 
     adds = payload.get("inventory_add")
     if isinstance(adds, list):
@@ -588,9 +657,12 @@ def parse_and_apply_mutations(
 
     1. Locates every ``<state_update>...</state_update>`` block via regex.
     2. Parses each payload as JSON and applies ``hp_change`` /
-       ``inventory_add`` / ``inventory_remove`` / ``quest_updates`` /
-       ``quest_add`` through StateManager (``quest_updates`` entries call
-       ``update_quest_status``; ``quest_add`` entries call ``upsert_quest``).
+       ``resource_change`` / ``ability_add`` / ``inventory_add`` /
+       ``inventory_remove`` / ``quest_updates`` / ``quest_add`` through
+       StateManager (``resource_change`` calls ``update_player_resource``;
+       ``ability_add`` entries call ``upsert_ability``; ``quest_updates``
+       entries call ``update_quest_status``; ``quest_add`` entries call
+       ``upsert_quest``).
     3. Returns the narrative with all blocks removed and trimmed.
 
     Malformed JSON blocks are logged and skipped, but the block is still
@@ -680,7 +752,6 @@ def create_app() -> FastAPI:
             lore,
             req.action_text,
             chat_history=chat_history,
-            temperature=LLM_TEMPERATURE,
         )
         try:
             raw_narrative = llm.complete(messages, temperature=LLM_TEMPERATURE)
