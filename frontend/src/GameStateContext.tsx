@@ -8,6 +8,10 @@
  *   - isProcessing    : true while the LLM is generating a narrative
  *   - error           : last failure message (null when healthy)
  *
+ * On mount (and whenever currentPlayerId changes) the provider restores the
+ * persisted chat log from GET /api/history/{playerId} so a page refresh does
+ * not lose the conversation.
+ *
  * Submit pipeline (submitAction):
  *   1. optimistically append the user's message to chatHistory
  *   2. set isProcessing = true, clear any previous error
@@ -24,11 +28,14 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode,
 } from "react";
 import {
+  ApiError,
+  getChatHistory,
   sendPlayerAction,
   type GameState,
 } from "./api";
@@ -82,7 +89,7 @@ export interface GameStateContextValue {
 // ---------------------------------------------------------------------------
 
 /** Test player id seeded in game_state.db for development. */
-const DEFAULT_PLAYER_ID = "kaelen";
+const DEFAULT_PLAYER_ID = "kriss_walker";
 
 let messageCounter = 0;
 
@@ -113,6 +120,39 @@ export function GameStateProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null);
 
   const dismissError = useCallback(() => setError(null), []);
+
+  // Restore the persisted conversation from the backend on mount and whenever
+  // the active player changes, so previous messages render immediately after
+  // a page refresh.
+  useEffect(() => {
+    let cancelled = false;
+    setChatHistory([]); // clear the log before loading a (possibly different) player's
+    getChatHistory(currentPlayerId)
+      .then((res) => {
+        if (cancelled) return;
+        setChatHistory(
+          res.messages.map((message) => ({
+            id: createMessageId(),
+            role: message.role,
+            content: message.content,
+          })),
+        );
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        // Unknown player (404) simply means there is nothing to restore.
+        if (err instanceof ApiError && err.status === 404) return;
+        // Any other failure is logged; the log stays empty and the player
+        // can still act (this is not an action failure, so no error banner).
+        console.warn(
+          "Failed to load chat history:",
+          err instanceof Error ? err.message : err,
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentPlayerId]);
 
   const submitAction = useCallback(
     async (text: string) => {

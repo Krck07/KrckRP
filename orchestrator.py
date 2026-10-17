@@ -50,6 +50,7 @@ from typing import Any, Optional, TYPE_CHECKING
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:  # type-checker only; these are imported lazily at runtime
@@ -551,7 +552,9 @@ def _apply_mutations(payload: dict[str, Any], player_id: str, state_mgr) -> None
 
     Handles ``hp_change``, ``resource_change`` (relative delta applied via
     :meth:`StateManager.update_player_resource`, clamped to
-    ``[0, max_resource]``), ``ability_add`` (each {"ability_id", "name",
+    ``[0, max_resource]``), ``location_id`` (moves the player via
+    :meth:`StateManager.update_player_location`; unknown location ids are a
+    safe no-op there), ``ability_add`` (each {"ability_id", "name",
     "resource_cost"} entry grants/refreshes a skill via
     :meth:`StateManager.upsert_ability`), ``inventory_add``,
     ``inventory_remove``, ``quest_updates`` (each {"quest_id", "status"} entry
@@ -576,6 +579,11 @@ def _apply_mutations(payload: dict[str, Any], player_id: str, state_mgr) -> None
         if delta:
             state_mgr.update_player_resource(player_id, delta)
             log.info("resource_change %+d applied to player %s", delta, player_id)
+
+    new_location_id = payload.get("location_id")
+    if isinstance(new_location_id, str) and new_location_id.strip():
+        state_mgr.update_player_location(player_id, new_location_id.strip())
+        log.info("location_id -> %s for player %s", new_location_id.strip(), player_id)
 
     ability_adds = payload.get("ability_add")
     if isinstance(ability_adds, list):
@@ -657,7 +665,7 @@ def parse_and_apply_mutations(
 
     1. Locates every ``<state_update>...</state_update>`` block via regex.
     2. Parses each payload as JSON and applies ``hp_change`` /
-       ``resource_change`` / ``ability_add`` / ``inventory_add`` /
+       ``resource_change`` / ``location_id`` / ``ability_add`` / ``inventory_add`` /
        ``inventory_remove`` / ``quest_updates`` / ``quest_add`` through
        StateManager (``resource_change`` calls ``update_player_resource``;
        ``ability_add`` entries call ``upsert_ability``; ``quest_updates``
@@ -691,6 +699,14 @@ def create_app() -> FastAPI:
         version="0.2.0",
     )
 
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Allows all origins (including http://localhost:5173)
+        allow_credentials=True,
+        allow_methods=["*"],  # Allows POST, GET, OPTIONS, etc.
+        allow_headers=["*"],
+    )
+
     @app.get("/health")
     def health() -> dict[str, Any]:
         """Liveness probe (no LLM call, no heavy init)."""
@@ -702,6 +718,31 @@ def create_app() -> FastAPI:
             "chroma_db": CHROMA_DB_PATH,
             "chroma_collection": CHROMA_COLLECTION,
             "embedding_model": EMBEDDING_MODEL,
+        }
+
+    @app.get("/api/history/{player_id}")
+    def get_chat_history(
+        player_id: str,
+        state_mgr=Depends(get_state_manager),  # -> StateManager
+    ) -> dict[str, Any]:
+        """Return the player's recent chat history (last 20 turns, oldest-first).
+
+        The frontend calls this on mount / player switch so the log survives
+        a page refresh. 404 when the player id is unknown.
+        """
+        if state_mgr.get_player_state(player_id) is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Player '{player_id}' not found in state. "
+                "Upsert the player first (StateManager.upsert_player).",
+            )
+        messages = state_mgr.get_chat_history(player_id, limit=20)
+        return {
+            "player_id": player_id,
+            "messages": [
+                {"id": index, "role": msg["role"], "content": msg["content"]}
+                for index, msg in enumerate(messages, start=1)
+            ],
         }
 
     @app.post("/api/action", response_model=PlayerActionResponse)

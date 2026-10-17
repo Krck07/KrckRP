@@ -5,8 +5,9 @@
  * Zero dependencies beyond the browser `fetch` API.
  *
  * Endpoints used:
- *   POST /api/action -> PlayerActionResponse
- *   GET  /health     -> flat liveness dict (no LLM / heavy init on the server)
+ *   POST /api/action            -> PlayerActionResponse
+ *   GET  /api/history/{playerId}-> ChatHistoryResponse (restore log on refresh)
+ *   GET  /health                -> flat liveness dict (no LLM / heavy init on the server)
  */
 
 const API_BASE_URL = "http://localhost:8000";
@@ -102,6 +103,20 @@ export interface PlayerActionResponse {
   current_state: GameState;
 }
 
+/** One persisted chat turn from GET /api/history/{player_id}. */
+export interface ChatHistoryMessage {
+  /** Server-assigned ordering key (1-based index into the returned window). */
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+}
+
+/** GET /api/history/{player_id} response: last 20 turns, oldest-first. */
+export interface ChatHistoryResponse {
+  player_id: string;
+  messages: ChatHistoryMessage[];
+}
+
 /** Flat liveness dict from GET /health. */
 export interface HealthResponse {
   status: string;
@@ -192,6 +207,54 @@ export async function sendPlayerAction(
 
   try {
     return (await response.json()) as PlayerActionResponse;
+  } catch {
+    throw new ApiError(
+      "Orchestrator returned a 200 but the body was not valid JSON.",
+      { status: response.status },
+    );
+  }
+}
+
+/**
+ * Fetch the player's persisted chat history (last 20 turns, oldest-first).
+ *
+ * GET {API_BASE_URL}/api/history/{playerId}
+ *
+ * Used on mount / player switch so the conversation survives a page refresh.
+ *
+ * @returns the parsed ChatHistoryResponse on success (200).
+ * @throws  ApiError on network failure, non-2xx status (e.g. 404 unknown
+ *          player), or a malformed JSON body.
+ */
+export async function getChatHistory(
+  playerId: string,
+): Promise<ChatHistoryResponse> {
+  if (!playerId || playerId.trim().length === 0) {
+    throw new ApiError("player_id must be a non-empty string.");
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(
+      `${API_BASE_URL}/api/history/${encodeURIComponent(playerId)}`,
+    );
+  } catch {
+    throw new ApiError(
+      "Could not reach the KrckRP orchestrator. " +
+        `Is it running at ${API_BASE_URL}?`,
+    );
+  }
+
+  if (!response.ok) {
+    const rawBody = await response.text().catch(() => "");
+    throw new ApiError(
+      `Orchestrator responded with ${response.status} ${response.statusText}.`,
+      { status: response.status, rawBody },
+    );
+  }
+
+  try {
+    return (await response.json()) as ChatHistoryResponse;
   } catch {
     throw new ApiError(
       "Orchestrator returned a 200 but the body was not valid JSON.",

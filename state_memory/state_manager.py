@@ -9,9 +9,12 @@ SQLite instead of vector search.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from contextlib import closing
 from typing import Any, Optional
+
+log = logging.getLogger("state_memory")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS Players (
@@ -362,6 +365,22 @@ class StateManager:
             ).fetchall()
         return [{"role": row[0], "content": row[1]} for row in reversed(rows)]
 
+    def get_chat_history(self, player_id: str, limit: int = 20) -> list[dict[str, str]]:
+        """Return the player's last ``limit`` chat turns, oldest-first (chronological).
+
+        Each entry is ``{"role": ..., "content": ...}`` -- the same shape
+        :meth:`get_recent_chat` produces for the LLM prompt window, but
+        intended for the frontend chat log (``GET /api/history/{player_id}``)
+        so a page refresh can restore the conversation.
+        """
+        with closing(sqlite3.connect(self._db_path)) as conn:
+            rows = conn.execute(
+                "SELECT role, content FROM ChatHistory "
+                "WHERE player_id = ? ORDER BY id DESC LIMIT ?",
+                (player_id, limit),
+            ).fetchall()
+        return [{"role": row[0], "content": row[1]} for row in reversed(rows)]
+
     # --------------------------------------------------------- state mutations
 
     def update_player_hp(self, player_id: str, hp_change: int) -> None:
@@ -389,6 +408,26 @@ class StateManager:
                 "WHERE id = ?",
                 (change, player_id),
             )
+
+    def update_player_location(self, player_id: str, location_id: str) -> None:
+        """Move the player: set Players.current_location_id to ``location_id``.
+
+        The UPDATE is guarded by an EXISTS check on the Locations table, so a
+        hallucinated (unknown) location id is a safe no-op with a warning log
+        instead of a FOREIGN KEY violation. No-op if the player id does not
+        exist.
+        """
+        with closing(sqlite3.connect(self._db_path)) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE Players SET current_location_id = ? "
+                "WHERE id = ? AND EXISTS (SELECT 1 FROM Locations WHERE id = ?)",
+                (location_id, player_id, location_id),
+            )
+            if cursor.rowcount == 0:
+                log.warning(
+                    "location change not applied: unknown player %r or location %r",
+                    player_id, location_id,
+                )
 
     def remove_inventory_item(self, item_id: str, owner_id: str) -> None:
         """Delete an inventory entry for the given owner (no-op if absent)."""
